@@ -2,7 +2,7 @@
 
 **Transform Animal Crossing into an AI-powered conversation experience!** This mod uses Large Language Models to generate dynamic, contextual dialogue for villagers in real-time.
 
-> ⚠️ **EXPERIMENTAL SOFTWARE**: This mod has known bugs and is only tested on macOS. Use at your own risk! PRs welcome to help improve it.
+> ⚠️ **EXPERIMENTAL SOFTWARE**: This mod has been configured from the previous llm mod for mac. Currently in progress. Use at your own risk! PRs welcome to help improve it.
 
 ## 🎥 What This Does
 
