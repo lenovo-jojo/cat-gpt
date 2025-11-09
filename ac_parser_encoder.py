@@ -32,6 +32,7 @@ import struct
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import List, Dict, Optional
 from datetime import datetime
 
@@ -101,6 +102,90 @@ REVERSE_CONTROL_CODES.update({
 })
 
 GLOBAL_GENERATION_LOCK = threading.Lock()
+
+FEELING_CHATTY_LABEL = "Feeling chatty"
+_CONTROL_TAG_RE = re.compile(r"<[^>]+>")
+_CHOICE_ONE_PATTERN = re.compile(
+    r"(<Open Choice Menu>)([\s\S]*?)(<Choice 1 Jump \[[0-9A-F]{4}\]>)",
+    re.IGNORECASE,
+)
+
+
+def _strip_control_codes(text: str) -> str:
+    return _CONTROL_TAG_RE.sub("", text)
+
+
+def _inject_feeling_chatty_option(text: str) -> Optional[str]:
+    def _replacement(match: re.Match) -> str:
+        between = match.group(2)
+        leading_ws_match = re.match(r"^\s*", between)
+        trailing_ws_match = re.search(r"\s*$", between)
+        leading_ws = leading_ws_match.group(0) if leading_ws_match else ""
+        trailing_ws = trailing_ws_match.group(0) if trailing_ws_match else ""
+        return (
+            f"{match.group(1)}"
+            f"{leading_ws}{FEELING_CHATTY_LABEL}{trailing_ws}"
+            f"{match.group(3)}"
+        )
+
+    if not _CHOICE_ONE_PATTERN.search(text):
+        return None
+    return _CHOICE_ONE_PATTERN.sub(_replacement, text, count=1)
+
+
+@dataclass
+class ConversationState:
+    lines_seen: int = 0
+    last_visible_text: Optional[str] = None
+    ready_for_chatty: bool = False
+    menu_injected: bool = False
+    awaiting_choice_resolution: bool = False
+    chatty_requested: bool = False
+    menu_skip_logged: bool = False
+
+    def reset(self) -> None:
+        self.lines_seen = 0
+        self.last_visible_text = None
+        self.ready_for_chatty = False
+        self.menu_injected = False
+        self.awaiting_choice_resolution = False
+        self.chatty_requested = False
+        self.menu_skip_logged = False
+
+    def observe_text(self, text: str) -> None:
+        if "<End Conversation>" in text:
+            self.reset()
+            return
+
+        if self.awaiting_choice_resolution and "<Open Choice Menu>" not in text:
+            self.awaiting_choice_resolution = False
+            self.menu_injected = False
+            self.menu_skip_logged = False
+            visible_followup = _strip_control_codes(text).strip()
+            if visible_followup:
+                self.chatty_requested = True
+                if visible_followup != self.last_visible_text:
+                    self.last_visible_text = visible_followup
+                    self.lines_seen += 1
+                    if self.lines_seen >= 2:
+                        self.ready_for_chatty = True
+            return
+
+        if "<Open Choice Menu>" in text:
+            if not self.ready_for_chatty and self.lines_seen >= 1:
+                self.ready_for_chatty = True
+            return
+
+        visible = _strip_control_codes(text).strip()
+        if not visible:
+            return
+
+        if visible != self.last_visible_text:
+            self.last_visible_text = visible
+            self.lines_seen += 1
+            if self.lines_seen >= 2:
+                self.ready_for_chatty = True
+            self.menu_skip_logged = False
 
 CODE_ARG_COUNT = {
     0x03: 1, 0x05: 3, 0x08: 3, 0x09: 3, 0x0A: 3, 0x0B: 3, 0x0C: 3, 0x0E: 2, 0x0F: 2, 0x10: 2, 0x11: 2, 0x12: 2,
@@ -414,6 +499,7 @@ def watch_dialogue(
     last_text_by_addr: Dict[int, Optional[str]] = {addr: None for addr in addresses}
     generation_in_progress: Dict[int, bool] = {addr: False for addr in addresses}
     suppress_until_by_addr: Dict[int, float] = {addr: 0.0 for addr in addresses}
+    conversation_state: Dict[int, ConversationState] = {addr: ConversationState() for addr in addresses}
     seen_characters = set()
     enable_screenshot = os.environ.get("ENABLE_SCREENSHOT", "0") == "1"
     enable_gossip = os.environ.get("ENABLE_GOSSIP", "0") == "1"
@@ -443,16 +529,66 @@ def watch_dialogue(
                 text = parse_ac_text(raw)
 
                 if print_all or text != last_text_by_addr[addr]:
+                    state = conversation_state[addr]
+                    state.observe_text(text)
+
                     now_ts = time.time()
                     if now_ts < suppress_until_by_addr.get(addr, 0.0):
                         if "<End Conversation>" in text:
                             suppress_until_by_addr[addr] = 0.0
+                            state.reset()
                         else:
                             last_text_by_addr[addr] = text
-                            continue
+                        continue
+
+                    if (
+                        state.ready_for_chatty
+                        and "<Open Choice Menu>" in text
+                        and not state.menu_injected
+                    ):
+                        modified = _inject_feeling_chatty_option(text)
+                        if modified and modified != text:
+                            predicted = parse_ac_text(encode_ac_text(modified))
+                            if write_dialogue_to_address(modified, addr):
+                                print("✨ Injected 'Feeling chatty' option into choice menu.")
+                                state.menu_injected = True
+                                state.awaiting_choice_resolution = True
+                                text = predicted
+                                last_text_by_addr[addr] = predicted
+                                header = f"Address 0x{addr:08X}"
+                                if include_speaker:
+                                    try:
+                                        speaker = get_current_speaker()
+                                        header += f" | Speaker: {speaker}"
+                                    except Exception:
+                                        pass
+                                print("Did generate: False")
+                                print(f"\n--- {header} ---")
+                                print(text)
+                                continue
+                    elif (
+                        "<Open Choice Menu>" in text
+                        and not state.menu_injected
+                        and not state.ready_for_chatty
+                        and not state.menu_skip_logged
+                    ):
+                        print(
+                            "ℹ️ Skipping 'Feeling chatty' injection: "
+                            f"lines_seen={state.lines_seen}, "
+                            f"awaiting_choice_resolution={state.awaiting_choice_resolution}, "
+                            f"chatty_requested={state.chatty_requested}"
+                        )
+                        state.menu_skip_logged = True
 
                     did_generate = False
-                    if not generation_in_progress.get(addr, False) and not GLOBAL_GENERATION_LOCK.locked():
+                    should_generate = state.chatty_requested and not state.awaiting_choice_resolution
+
+                    if (
+                        should_generate
+                        and not generation_in_progress.get(addr, False)
+                        and not GLOBAL_GENERATION_LOCK.locked()
+                    ):
+                        state.chatty_requested = False
                         generation_in_progress[addr] = True
 
                         initial_text = text
@@ -463,33 +599,29 @@ def watch_dialogue(
                             except Exception:
                                 current_speaker_for_gen = None
 
-                        # show a tiny loading beat
                         loading_text = ".<Pause [0A]>.<Pause [0A]>.<Pause [0A]><Press A><Clear Text>"
 
-                        # run gen one-at-a-time
                         with GLOBAL_GENERATION_LOCK:
                             write_dialogue_to_address(loading_text, addr)
 
-                            # 👇 ALWAYS capture a screenshot of the Dolphin AC window if enabled
                             image_paths = None
                             if enable_screenshot:
-                                # small delay to let the facebox settle visually
                                 time.sleep(0.15)
                                 shot = _take_dolphin_window_screenshot()
                                 if shot:
                                     image_paths = [shot]
 
-                            # build gossip ctx
                             gossip_ctx = None
                             if enable_gossip and current_speaker_for_gen:
                                 try:
                                     observe_interaction(current_speaker_for_gen, villager_names=sorted(seen_characters))
-                                    gossip_ctx = get_context_for(current_speaker_for_gen, villager_names=sorted(seen_characters))
+                                    gossip_ctx = get_context_for(
+                                        current_speaker_for_gen, villager_names=sorted(seen_characters)
+                                    )
                                 except Exception:
                                     gossip_ctx = None
 
                             try:
-                                # use spotlight vs normal gen
                                 if is_start_menu_time_announcement(initial_text) and current_speaker_for_gen:
                                     llm_text = generate_spotlight_dialogue(
                                         current_speaker_for_gen, image_paths=image_paths, gossip_context=gossip_ctx
@@ -506,7 +638,6 @@ def watch_dialogue(
                                 combined = llm_text
                                 write_dialogue_to_address(combined, addr)
 
-                                # predict parsed to avoid immediate retrigger
                                 encoded_combined = encode_ac_text(combined)
                                 predicted = parse_ac_text(encoded_combined)
                                 last_text_by_addr[addr] = predicted
@@ -517,6 +648,8 @@ def watch_dialogue(
                                 print(f"⚠ generation error: {e}")
                             finally:
                                 generation_in_progress[addr] = False
+                                state.menu_injected = False
+                                state.awaiting_choice_resolution = False
 
                     print(f"Did generate: {did_generate}")
                     header = f"Address 0x{addr:08X}"
@@ -530,6 +663,10 @@ def watch_dialogue(
                     print(text)
                     if not did_generate:
                         last_text_by_addr[addr] = text
+                        if "<End Conversation>" in text:
+                            state.reset()
+                        elif not state.awaiting_choice_resolution:
+                            state.chatty_requested = False
 
             time.sleep(max(0.0, interval_s))
     except KeyboardInterrupt:
